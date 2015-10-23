@@ -378,7 +378,7 @@ to single-step.
         	    return;
         	// thisContext
         	case 0x89:
-        	    this.generateInstruction("thisContext", "stack[++vm.sp] = context; vm.reclaimableContextCount = 0");
+        	    this.generateInstruction("thisContext", "stack[++vm.sp] = vm.exportThisContext()");
         	    return;
             // closures
             case 0x8A:
@@ -666,10 +666,10 @@ to single-step.
     generateClosureCopy: function(numArgs, numCopied, blockSize) {
         var from = this.pc,
             to = from + blockSize;
-        if (this.debug) this.generateDebugCode("push closure(" + from + "-" + (to-1) + "): " + numArgs + " args, " + numCopied + " captured");
+        if (this.debug) this.generateDebugCode("push closure(" + from + "-" + (to-1) + "): " + numCopied + " copied, " + numArgs + " args");
         this.generateLabel();
         this.source.push(
-            "var closure = vm.instantiateClass(vm.specialObjects[36], ", numCopied + 3, ");\n",
+            "var closure = vm.instantiateClass(vm.specialObjects[36], ", numCopied, ");\n",
             "closure.pointers[0] = context; vm.reclaimableContextCount = 0;\n",
             "closure.pointers[1] = ", from + this.method.pointers.length * 4 + 1, ";\n",  // encodeSqueakPC
             "closure.pointers[2] = ", numArgs, ";\n");

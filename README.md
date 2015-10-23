@@ -101,6 +101,13 @@ There's a gazillion exciting things to do :)
 
 Changelog
 ---------
+    2015-08-13: 0.7.9 make work on iOS again
+    2015-07-18: 0.7.8 fix keyboard
+    2015-06-09: 0.7.7 fix thisContext
+    2015-04-27: 0.7.6 revert JIT, minor fixes
+    2015-04-14: 0.7.5 JIT optimizations by HPI students (reverted in 0.7.6)
+    2015-02-18: 0.7.4 make pre-release image work
+    2015-01-30: 0.7.3 JSBridge: fix closure callbacks
     2015-01-25: 0.7.2 JSBridge: add asJSObject
     2014-12-22: 0.7.1 cursor shapes
     2014-12-04: 0.7 support finalization of weak references

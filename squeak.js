@@ -56,25 +56,32 @@ window.module = function(dottedPath) {
     return self;
 };
 
-Object.subclass = function(classPath /* + more args */ ) {
-    var path = classPath.split("."),
-        className = path.pop();
-    var newClass = function() {
-        if (this.initialize) this.initialize.apply(this, arguments);
-        return this;
-    };
-    // skip arg 0, copy properties of other args to class proto
-    for (var i = 1; i < arguments.length; i++)
-        for (name in arguments[i])
-            newClass.prototype[name] = arguments[i][name];
-    module(path.join('.'))[className] = newClass;
-};
-
 Object.extend = function(obj /* + more args */ ) {
     // skip arg 0, copy properties of other args to obj
     for (var i = 1; i < arguments.length; i++)
-        for (name in arguments[i])
-            obj[name] = arguments[i][name];
+        if (typeof arguments[i] == 'object')
+            for (name in arguments[i])
+                obj[name] = arguments[i][name];
+};
+
+Function.prototype.subclass = function(classPath /* + more args */ ) {
+    // create subclass
+    var subclass = function() {
+        if (this.initialize) this.initialize.apply(this, arguments);
+        return this;
+    };
+    // set up prototype
+    var protoclass = function() { };
+    protoclass.prototype = this.prototype;
+    subclass.prototype = new protoclass();
+    // skip arg 0, copy properties of other args to prototype
+    for (var i = 1; i < arguments.length; i++)
+        Object.extend(subclass.prototype, arguments[i]);
+    // add class to module
+    var modulePath = classPath.split("."),
+        className = modulePath.pop();
+    module(modulePath.join('.'))[className] = subclass;
+    return subclass;
 };
 
 //////////////////////////////////////////////////////////////////////////////
@@ -279,7 +286,7 @@ function recordKeyboardEvent(key, timestamp, display, eventQueue) {
             key, // MacRoman
             Squeak.EventKeyChar,
             display.buttons >> 3,
-            0,  // Unicode
+            key,  // Unicode
         ]);
         if (display.signalInputEvent)
             display.signalInputEvent();
@@ -335,6 +342,7 @@ function createSqueakDisplay(canvas, options) {
         fullscreen: false,
         width: 0,   // if 0, VM uses canvas.width
         height: 0,  // if 0, VM uses canvas.height
+        scale: 1,   // changed dynamically by VM if fixedWidth is set
         mouseX: 0,
         mouseY: 0,
         buttons: 0,
@@ -349,6 +357,10 @@ function createSqueakDisplay(canvas, options) {
         // additional functions added below
     };
     setupSwapButtons(options);
+    if (options.pixelated) {
+        canvas.classList.add("pixelated");
+        display.cursorCanvas.classList.add("pixelated");
+    }
 
     var eventQueue = null;
     display.reset = function() {
@@ -358,9 +370,14 @@ function createSqueakDisplay(canvas, options) {
         display.getNextEvent = function(firstEvtBuf, firstOffset) {
             // might be called from VM to get queued event
             eventQueue = []; // create queue on first call
-            display.getNextEvent = function getNextEvent(evtBuf, timeOffset) {
+            eventQueue.push = function(evt) {
+                eventQueue.offset = Date.now() - evt[1]; // get epoch from first event
+                delete eventQueue.push;                  // use original push from now on
+                eventQueue.push(evt);
+            }
+            display.getNextEvent = function(evtBuf, timeOffset) {
                 var evt = eventQueue.shift();
-                if (evt) makeSqueakEvent(evt, evtBuf, timeOffset);
+                if (evt) makeSqueakEvent(evt, evtBuf, timeOffset - eventQueue.offset);
                 else evtBuf[0] = Squeak.EventTypeNone;
             };
             display.getNextEvent(firstEvtBuf, firstOffset);
@@ -651,6 +668,15 @@ function createSqueakDisplay(canvas, options) {
             canvas.height = display.height;
             if (imgData) display.context.putImageData(imgData, 0, 0);
         }
+        // set cursor scale
+        if (options.fixedWidth) {
+            display.scale = parseInt(canvas.style.width) / canvas.width;
+            var cursorCanvas = display.cursorCanvas;
+            cursorCanvas.style.width = (cursorCanvas.width * display.scale) + "px";
+            cursorCanvas.style.height = (cursorCanvas.height * display.scale) + "px";
+        } else {
+            display.scale = 1;
+        }
     };
     window.onresize();
     return display;
@@ -742,16 +768,20 @@ SqueakJS.runImage = function(buffer, name, display, options) {
 };
 
 function processOptions(options) {
-    var search = decodeURIComponent(window.location.hash).slice(1),
+    var search = window.location.hash.slice(1),
         args = search && search.split("&");
     if (args) for (var i = 0; i < args.length; i++) {
         var keyAndVal = args[i].split("="),
             key = keyAndVal[0],
-            val = keyAndVal[1];
-        try { val = JSON.parse(val); } catch(e) {
-            if (val[0] === "[") val = val.slice(1,-1).split(","); // handle string arrays
-            // if not JSON use string itself
-         };
+            val = true;
+        if (keyAndVal.length > 1) {
+            val = decodeURIComponent(keyAndVal.slice(1).join("="));
+            if (val.match(/^(true|false|null|[0-9"[{].*)$/))
+                try { val = JSON.parse(val); } catch(e) {
+                    if (val[0] === "[") val = val.slice(1,-1).split(","); // handle string arrays
+                    // if not JSON use string itself
+                };
+        }
         options[key] = val;
     }
     var root = Squeak.splitFilePath(options.root || "/").fullname;
@@ -793,8 +823,9 @@ SqueakJS.runSqueak = function(imageUrl, canvas, options) {
     }
     function getNextFile(whenAllDone) {
         if (files.length === 0) return whenAllDone(imageData);
-        var file = files.shift();
-        if (!file.forceDownload && Squeak.fileExists(options.root + file.name)) {
+        var file = files.shift(),
+            forceDownload = options.forceDownload || file.forceDownload;
+        if (!forceDownload && Squeak.fileExists(options.root + file.name)) {
             if (file.name == imageName) {
                 Squeak.fileGet(options.root + file.name, function(data) {
                     imageData = data;

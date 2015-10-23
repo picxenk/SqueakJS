@@ -1,7 +1,7 @@
 module('users.bert.SqueakJS.vm').requires().toRun(function() {
 "use strict";    
 /*
- * Copyright (c) 2013,2014 Bert Freudenberg
+ * Copyright (c) 2013-2015 Bert Freudenberg
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -28,7 +28,7 @@ window.Squeak = users.bert.SqueakJS.vm;
 Object.extend(Squeak,
 "version", {
     // system attributes
-    vmVersion: "SqueakJS 0.7.2",
+    vmVersion: "SqueakJS 0.7.9",
     vmBuild: "unknown",                 // replace at runtime by last-modified?
     vmPath: "/",
     vmFile: "vm.js",
@@ -312,13 +312,16 @@ Object.extend(Squeak,
     dbTransaction: function(mode, description, transactionFunc, completionFunc) {
         // File contents is stored in the IndexedDB named "squeak" in object store "files"
         // and directory entries in localStorage with prefix "squeak:"
-        if (typeof indexedDB == "undefined") {
+        function fakeTransaction() {
             transactionFunc(Squeak.dbFake());
             if (completionFunc) completionFunc();
-            return;
+        }
+    
+        if (typeof indexedDB == "undefined") {
+            return fakeTransaction();
         }
 
-        var startTransaction = function() {
+        function startTransaction() {
             var trans = SqueakDB.transaction("files", mode),
                 fileStore = trans.objectStore("files");
             trans.oncomplete = function(e) { if (completionFunc) completionFunc(); }
@@ -337,25 +340,35 @@ Object.extend(Squeak,
 
         // otherwise, open SqueakDB first
         var openReq = indexedDB.open("squeak");
+        
+        // UIWebView implements the interface but only returns null
+        // https://stackoverflow.com/questions/27415998/indexeddb-open-returns-null-on-safari-ios-8-1-1-and-halts-execution-on-cordova
+        if (!openReq) {
+            return fakeTransaction();
+        }
+
         openReq.onsuccess = function(e) {
+            console.log("Opened files database.");
             window.SqueakDB = this.result;
             SqueakDB.onversionchange = function(e) {
                 delete window.SqueakDB;
                 this.close();
             };
             SqueakDB.onerror = function(e) {
-                console.log("Error accessing database: " + e.target.errorCode);
+                console.error("Error accessing database: " + e.target.error.name);
             };
             startTransaction();
         };
         openReq.onupgradeneeded = function (e) {
             // run only first time, or when version changed
-            console.log("Creating database version " + e.newVersion);
+            console.log("Creating files database");
             var db = e.target.result;
             db.createObjectStore("files");
         };
         openReq.onerror = function(e) {
-            console.log("Error opening database: " + e.target.errorCode);
+            console.error(e.target.error.name + ": cannot open files database");
+            console.warn("Falling back to local storage");
+            fakeTransaction();
         };
         openReq.onblocked = function(e) {
             // If some other tab is loaded with the database, then it needs to be closed
@@ -394,10 +407,10 @@ Object.extend(Squeak,
                             buffer = bytes.buffer;
                         }
                     }
-                    var req = {result: buffer};
+                    var req = {result: buffer, error: "file not found"};
                     setTimeout(function(){
-                        if (buffer && req.onsuccess) req.onsuccess();
-                        if (!buffer && req.onerror) req.onerror();
+                        if (buffer && req.onsuccess) req.onsuccess({target: req});
+                        if (!buffer && req.onerror) req.onerror({target: req});
                     }, 0);
                     return req;
                 },
@@ -428,6 +441,11 @@ Object.extend(Squeak,
                     setTimeout(function(){if (req.onsuccess) req.onsuccess()}, 0);
                     return req;
                 },
+                openCursor: function() {
+                    var req = {};
+                    setTimeout(function(){if (req.onsuccess) req.onsuccess({target: req})}, 0);
+                    return req;
+                },
             }
         }
         return SqueakDBFake;
@@ -441,7 +459,7 @@ Object.extend(Squeak,
             return thenDo(SqueakDBFake.bigFiles[path.fullname]);
         this.dbTransaction("readonly", "get " + filepath, function(fileStore) {
             var getReq = fileStore.get(path.fullname);
-            getReq.onerror = function(e) { errorDo(this.errorCode) };
+            getReq.onerror = function(e) { errorDo(e.target.error.name) };
             getReq.onsuccess = function(e) {
                 if (this.result !== undefined) return thenDo(this.result);
                 // might be a template
@@ -808,7 +826,7 @@ Object.subclass('Squeak.Image',
             }
         };
         // read version and determine endianness
-        var versions = [6502, 6504, 6505, 68000, 68002, 68003],
+        var versions = [6501, 6502, 6504, 6505, 68000, 68002, 68003],
             version = 0,
             fileHeaderSize = 0;
         while (true) {  // try all four endianness + header combos
@@ -819,8 +837,9 @@ Object.subclass('Squeak.Image',
             if (!littleEndian) fileHeaderSize += 512;
             if (fileHeaderSize > 512) throw Error("bad image version");
         };
-        var nativeFloats = (version & 1) != 0;
-        this.hasClosures = version == 6504 || version == 68002 || nativeFloats;
+        this.version = version;
+        var nativeFloats = [6505, 68003].indexOf(version) >= 0;
+        this.hasClosures = [6504, 6505, 68002, 68003].indexOf(version) >= 0;
         if (version >= 68000) throw Error("64 bit images not supported yet");
         // parse image header
         var imageHeaderSize = readWord();
@@ -897,6 +916,7 @@ Object.subclass('Squeak.Image',
             } else { // done
                 self.specialObjectsArray = splObs;
                 self.decorateKnownObjects();
+                self.fixCompiledMethods();
                 self.fixCompactOops();
                 return false;   // don't do more
             }
@@ -950,6 +970,17 @@ Object.subclass('Squeak.Image',
             obj = obj.nextObject;
         }
         this.oldSpaceBytes += adjust;
+    },
+    fixCompiledMethods: function() {
+        // in the 6501 pre-release image, some CompiledMethods
+        // do not have the proper class
+        if (this.version >= 6502) return;
+        var obj = this.firstOldObject,
+            compiledMethodClass = this.specialObjectsArray.pointers[Squeak.splOb_ClassCompiledMethod];
+        while (obj) {
+            if (obj.format >= 12) obj.sqClass = compiledMethodClass;
+            obj = obj.nextObject;
+        }
     },
 },
 'garbage collection', {
@@ -1859,6 +1890,9 @@ Object.subclass('Squeak.Interpreter',
         // hack for old image that does not support Unix files
         if (!this.hasClosures && !this.findMethod("UnixFileDirectory class>>pathNameDelimiter"))
             this.primHandler.emulateMac = true;
+        // pre-release image has inverted colors
+        if (this.image.version == 6501)
+            this.primHandler.reverseDisplay = true;
     },
     initVMState: function() {
         this.byteCodeCount = 0;
@@ -2048,7 +2082,7 @@ Object.subclass('Squeak.Interpreter',
             case 0x87: this.pop(); return;  // pop
             case 0x88: this.push(this.top()); return;   // dup
             // thisContext
-            case 0x89: this.push(this.activeContext); this.reclaimableContextCount = 0; return;
+            case 0x89: this.push(this.exportThisContext()); return;
 
             // Closures
             case 0x8A: this.pushNewArray(this.nextByte());   // create new temp vector
@@ -2174,9 +2208,10 @@ Object.subclass('Squeak.Interpreter',
         this.isIdle = hasTimer || !hadTimer;
         this.breakOut();
     },
-    freeze: function() {
+    freeze: function(frozenDo) {
         // Stop the interpreter. Answer a function that can be
         // called to continue interpreting.
+        // Optionally, frozenDo is called asynchronously when frozen
         var continueFunc;
         this.frozen = true;
         this.breakOutOfInterpreter = function(thenDo) {
@@ -2184,11 +2219,13 @@ Object.subclass('Squeak.Interpreter',
             continueFunc = thenDo;
             return "frozen";
         }.bind(this);
-        return function unfreeze() {
+        var unfreeze = function() {
             this.frozen = false;
             if (!continueFunc) throw Error("no continue function");
             continueFunc(0);    //continue without timeout
         }.bind(this);
+        if (frozenDo) window.setTimeout(function(){frozenDo(unfreeze)}, 0);
+        return unfreeze;
     },
     breakOut: function() {
         this.breakOutOfInterpreter = this.breakOutOfInterpreter || true; // do not overwrite break string
@@ -2349,8 +2386,7 @@ Object.subclass('Squeak.Interpreter',
         this.push(closure);
     },
     newClosure: function(numArgs, initialPC, numCopied) {
-        var size = Squeak.Closure_firstCopiedValue + numCopied,
-            closure = this.instantiateClass(this.specialObjects[Squeak.splOb_ClassBlockClosure], size);
+        var closure = this.instantiateClass(this.specialObjects[Squeak.splOb_ClassBlockClosure], numCopied);
         closure.pointers[Squeak.Closure_startpc] = initialPC;
         closure.pointers[Squeak.Closure_numArgs] = numArgs;
         return closure;
@@ -2524,16 +2560,14 @@ Object.subclass('Squeak.Interpreter',
         }
     },
     aboutToReturnThrough: function(resultObj, aContext) {
-        this.reclaimableContextCount = 0;
-        this.push(this.activeContext);
+        this.push(this.exportThisContext());
         this.push(resultObj);
         this.push(aContext);
         var aboutToReturnSel = this.specialObjects[Squeak.splOb_SelectorAboutToReturn];
         this.send(aboutToReturnSel, 2);
     },
     cannotReturn: function(resultObj) {
-        this.reclaimableContextCount = 0;
-        this.push(this.activeContext);
+        this.push(this.exportThisContext());
         this.push(resultObj);
         var cannotReturnSel = this.specialObjects[Squeak.splOb_SelectorCannotReturn];
         this.send(cannotReturnSel, 1);
@@ -2686,6 +2720,11 @@ Object.subclass('Squeak.Interpreter',
         this.storeContextRegisters();
         this.activeContext = newContext; //We're off and running...
         this.fetchContextRegisters(newContext);
+    },
+    exportThisContext: function() {
+        this.storeContextRegisters();
+        this.reclaimableContextCount = 0;
+        return this.activeContext;
     },
     fetchContextRegisters: function(ctxt) {
         var meth = ctxt.pointers[Squeak.Context_method];
@@ -3302,12 +3341,12 @@ Object.subclass('Squeak.Primitives',
             case 20: return false; // primitiveRemLargeIntegers
             case 21: return false; // primitiveAddLargeIntegers
             case 22: return false; // primitiveSubtractLargeIntegers
-            case 23: return false; // primitiveLessThanLargeIntegers
-            case 24: return false; // primitiveGreaterThanLargeIntegers
-            case 25: return false; // primitiveLessOrEqualLargeIntegers
-            case 26: return false; // primitiveGreaterOrEqualLargeIntegers
-            case 27: return false; // primitiveEqualLargeIntegers
-            case 28: return false; // primitiveNotEqualLargeIntegers
+            case 23: return this.primitiveLessThanLargeIntegers();
+            case 24: return this.primitiveGreaterThanLargeIntegers();
+            case 25: return this.primitiveLessOrEqualLargeIntegers();
+            case 26: return this.primitiveGreaterOrEqualLargeIntegers();
+            case 27: return this.primitiveEqualLargeIntegers();
+            case 28: return this.primitiveNotEqualLargeIntegers();
             case 29: return false; // primitiveMultiplyLargeIntegers
             case 30: return false; // primitiveDivideLargeIntegers
             case 31: return false; // primitiveModLargeIntegers
@@ -3517,6 +3556,7 @@ Object.subclass('Squeak.Primitives',
             case 211: if (this.oldPrims) return this.namedPrimitive('SocketPlugin', 'primitiveSocketConnectionStatus', argCount);
                 else return this.popNandPushIfOK(3, this.objectAtPut(false,false,false)); // contextAt:put:
             case 212: if (this.oldPrims) return this.namedPrimitive('SocketPlugin', 'primitiveSocketError', argCount);
+                else return this.popNandPushIfOK(1, this.objectSize(false)); // contextSize
             case 213: if (this.oldPrims) return this.namedPrimitive('SocketPlugin', 'primitiveSocketLocalAddress', argCount);
             case 214: if (this.oldPrims) return this.namedPrimitive('SocketPlugin', 'primitiveSocketLocalPort', argCount);
             case 215: if (this.oldPrims) return this.namedPrimitive('SocketPlugin', 'primitiveSocketRemoteAddress', argCount);
@@ -3786,8 +3826,8 @@ Object.subclass('Squeak.Primitives',
         }
         var bytes = stackVal.bytes,
             value = 0;
-        for (var i=0; i<4; i++)
-            value += (bytes[i]&255) * (1 << 8*i);
+        for (var i = 0, f = 1; i < 4; i++, f *= 256)
+            value += bytes[i] * f;
         if (this.isA(stackVal, Squeak.splOb_ClassLargePositiveInteger))
             return value;
         if (this.isA(stackVal, Squeak.splOb_ClassLargeNegativeInteger))
@@ -3812,6 +3852,27 @@ Object.subclass('Squeak.Primitives',
     },
     stackBoolean: function(nDeep) {
         return this.checkBoolean(this.vm.stackValue(nDeep));
+    },
+    stackSigned53BitInt:function(nDeep) {
+        var stackVal = this.vm.stackValue(nDeep);
+        if (typeof stackVal === "number") {   // SmallInteger
+            return stackVal;
+        }
+        var n = stackVal.bytesSize();
+        if (n <= 7) {
+            var bytes = stackVal.bytes,
+                value = 0;
+            for (var i = 0, f = 1; i < n; i++, f *= 256)
+                value += bytes[i] * f;
+            if (value < 9007199254740992) {
+                if (this.isA(stackVal, Squeak.splOb_ClassLargePositiveInteger))
+                    return value;
+                if (this.isA(stackVal, Squeak.splOb_ClassLargeNegativeInteger))
+                    return -value;
+            }
+        }
+        this.success = false;
+        return 0;
     },
 },
 'numbers', {
@@ -3878,6 +3939,24 @@ Object.subclass('Squeak.Primitives',
             ? mantissa * Math.pow(2, -1074) * Math.pow(2, exponent + 1074)
             : mantissa * Math.pow(2, exponent);
     },
+    primitiveLessThanLargeIntegers: function() {
+        return this.pop2andPushBoolIfOK(this.stackSigned53BitInt(1) < this.stackSigned53BitInt(0));
+    },
+    primitiveGreaterThanLargeIntegers: function() {
+        return this.pop2andPushBoolIfOK(this.stackSigned53BitInt(1) > this.stackSigned53BitInt(0));
+    },
+    primitiveLessOrEqualLargeIntegers: function() {
+        return this.pop2andPushBoolIfOK(this.stackSigned53BitInt(1) <= this.stackSigned53BitInt(0));
+    },
+    primitiveGreaterOrEqualLargeIntegers: function() {
+        return this.pop2andPushBoolIfOK(this.stackSigned53BitInt(1) >= this.stackSigned53BitInt(0));
+    },
+    primitiveEqualLargeIntegers: function() {
+        return this.pop2andPushBoolIfOK(this.stackSigned53BitInt(1) === this.stackSigned53BitInt(0));
+    },
+    primitiveNotEqualLargeIntegers: function() {
+        return this.pop2andPushBoolIfOK(this.stackSigned53BitInt(1) !== this.stackSigned53BitInt(0));
+    },
 },
 'utils', {
     floatOrInt: function(obj) {
@@ -3896,10 +3975,10 @@ Object.subclass('Squeak.Primitives',
             this.success = false;
             return 0;
         }
-        var bytes = obj.bytes;
-        var value = 0;
-        for (var i=0; i<4; i++)
-            value += (bytes[i]&255) * (1 << 8*i);
+        var bytes = obj.bytes,
+            value = 0;
+        for (var i = 0, f = 1; i < 4; i++, f *= 256)
+            value += bytes[i] * f;
         return value;
     },
     checkFloat: function(maybeFloat) { // returns a number and sets success
@@ -4847,8 +4926,11 @@ Object.subclass('Squeak.Primitives',
             } else {
                 this.showForm(context, cursorForm, bounds, true);
             }
-            this.display.cursorOffsetX = cursorForm.offsetX;
-            this.display.cursorOffsetY = cursorForm.offsetY;
+            var scale = this.display.scale || 1;
+            cursorCanvas.style.width = (cursorCanvas.width * scale) + "px";
+            cursorCanvas.style.height = (cursorCanvas.height * scale) + "px";
+            this.display.cursorOffsetX = cursorForm.offsetX * scale;
+            this.display.cursorOffsetY = cursorForm.offsetY * scale;
         }
         this.vm.popN(argCount);
         return true;
@@ -4883,6 +4965,15 @@ Object.subclass('Squeak.Primitives',
     primitiveReverseDisplay: function(argCount) {
         this.reverseDisplay = !this.reverseDisplay;
         this.redrawDisplay();
+        if (this.display.cursorCanvas) {
+            var canvas = this.display.cursorCanvas,
+                context = canvas.getContext("2d"),
+                image = context.getImageData(0, 0, canvas.width, canvas.height),
+                data = new Uint32Array(image.data.buffer);
+            for (var i = 0; i < data.length; i++)
+                data[i] = data[i] ^ 0x00FFFFFF;
+            context.putImageData(image, 0, 0);
+        }
         return true;
     },
     primitiveShowDisplayRect: function(argCount) {
@@ -4939,10 +5030,14 @@ Object.subclass('Squeak.Primitives',
                     }
                     this.swappedColors = colors;
                 }
-                if (this.reverseDisplay && !cursorColors) {
-                    if (!this.reversedColors)
-                        this.reversedColors = colors.map(function(c){return c ^ 0x00FFFFFF});
-                    colors = this.reversedColors;
+                if (this.reverseDisplay) {
+                    if (cursorColors) {
+                        colors = cursorColors.map(function(c){return c ^ 0x00FFFFFF});
+                    } else {
+                        if (!this.reversedColors)
+                            this.reversedColors = colors.map(function(c){return c ^ 0x00FFFFFF});
+                        colors = this.reversedColors;
+                    }
                 }
                 var mask = (1 << form.depth) - 1;
                 var leftSrcShift = 32 - (srcX % form.pixPerWord + 1) * form.depth;
@@ -5431,19 +5526,20 @@ Object.subclass('Squeak.Primitives',
         } else {
             if (file.contents === false) // failed to get contents before
                 return false;
-            var unfreeze = this.vm.freeze();
-            Squeak.fileGet(file.name,
-                function success(contents){
-                    file.contents = this.asUint8Array(contents);
-                    unfreeze();
-                    func(file);
-                }.bind(this),
-                function error(msg) {
-                    console.log("File get failed: " + msg);
-                    file.contents = false;
-                    unfreeze();
-                    func(file);
-                }.bind(this));
+            this.vm.freeze(function(unfreeze) {
+                Squeak.fileGet(file.name,
+                    function success(contents) {
+                        file.contents = this.asUint8Array(contents);
+                        unfreeze();
+                        func(file);
+                    }.bind(this),
+                    function error(msg) {
+                        console.log("File get failed: " + msg);
+                        file.contents = false;
+                        unfreeze();
+                        func(file);
+                    }.bind(this));
+            }.bind(this));
         }
         return true;
     },
@@ -5487,7 +5583,6 @@ Object.subclass('Squeak.Primitives',
             this.vm.warnOnce("could not initialize audio");
             return false;
         }
-        this.audioContext.sampleRate = samplesPerSec;
         this.audioSema = semaIndex; // signal when ready to accept another buffer of samples
         this.audioNextTimeSlot = 0;
         this.audioBuffersReady = [];
@@ -5607,8 +5702,6 @@ Object.subclass('Squeak.Primitives',
                 self.audioInSema = semaIndex;
                 self.audioInBuffers = [];
                 self.audioInBufferIndex = 0;
-                // try to set sampling rate
-                self.audioInContext.sampleRate = samplesPerSec;
                 self.audioInOverSample = 1;
                 // if sample rate is still too high, adjust oversampling
                 while (samplesPerSec * self.audioInOverSample < self.audioInContext.sampleRate)
@@ -6016,6 +6109,8 @@ Object.subclass('Squeak.Primitives',
             // make array with expected number of arguments for block
             var numArgs = callback.block.pointers[Squeak.BlockContext_argumentCount],
                 args = [];
+            if (typeof numArgs !== 'number')
+                numArgs = callback.block.pointers[Squeak.Closure_numArgs];
             for (var i = 0; i < numArgs; i++)
                 args.push(callback.args[i]);
             return this.popNandPushIfOK(argCount, this.makeStArray(args, proxyClass));
@@ -6108,9 +6203,13 @@ Object.subclass('Squeak.Primitives',
             this.vm.interpret();
         var result = this.js_activeCallback.result;
         this.js_activeCallback = null;
-        // return result to caller
-        return result ? this.js_fromStObject(result) :
+        if (result) {
+            // return result to JS caller as JS object or string
+            try { return this.js_fromStObject(result); }
+            catch(err) { return result.toString(); }
+        } else {
             console.error("Callback error: " + (this.vm.frozen ? "frozen" : "timeout"));
+        }
     },
     js_objectOrGlobal: function(sqObject) {
         return 'jsObject' in sqObject ? sqObject.jsObject : window;
@@ -6415,8 +6514,7 @@ Object.subclass('Squeak.InterpreterProxy',
     stackBytes: function(n) {
         var oop = this.vm.stackValue(n);
         if (oop.bytes) return oop.bytes;
-        if (oop.words) return oop.wordsAsUint8Array();
-        if (typeof oop === "number" || !oop.isWordsOrBytes()) this.successFlag = false;
+        if (typeof oop === "number" || !oop.isBytes()) this.successFlag = false;
         return [];
     },
     stackWords: function(n) {
@@ -6747,7 +6845,7 @@ Object.subclass('Squeak.InstructionPrinter',
     pushClosureCopy: function(numCopied, numArgs, blockSize) {
         var from = this.scanner.pc,
             to = from + blockSize;
-        this.print('closure(' + from + '-' + (to-1) + '): ' + numCopied + ' captured, ' + numArgs + ' args');
+        this.print('closure(' + from + '-' + (to-1) + '): ' + numCopied + ' copied, ' + numArgs + ' args');
         for (var i = from; i < to; i++)
             this.innerIndents[i] = (this.innerIndents[i] || 0) + 1;
         if (to > this.endPC) this.endPC = to;
@@ -6760,12 +6858,7 @@ Object.subclass('Squeak.InstructionStream',
         this.vm = vm;
         this.method = method;
         this.pc = 0;
-        this.specialConstants = ['true', 'false', 'nil', '-1', '0', '1', '2'];
-        this.specialSelectors = ['+', '-', '<', '>', '<=', '>=', '=', '~=', '*', '/', '\\', '@',
-            'bitShift:', '//', 'bitAnd:', 'bitOr:', 'at:', 'at:put:', 'size', 'next', 'nextPut:',
-            'atEnd', '==', 'class', 'blockCopy:', 'value', 'value:', 'do:', 'new', 'new:', 'x', 'y'];
-        this.specialSelectorsNArgs = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 0, 0, 1,
-            0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0];
+        this.specialConstants = [vm.trueObj, vm.falseObj, vm.nilObj, -1, 0, 1, 2];
     },
 },
 'decoding',
@@ -6804,12 +6897,12 @@ Object.subclass('Squeak.InstructionStream',
             else return client.jumpIf(offset<12, (offset & 3)*256 + byte);
         }
         if (type === 11)
-            return client.send(this.specialSelectors[offset],
-                this.specialSelectorsNArgs[offset],
+            return client.send(this.vm.specialSelectors[2 * offset],
+                this.vm.specialSelectors[2 * offset + 1],
                 false);
         if (type === 12)
-            return client.send(this.specialSelectors[offset+16],
-                this.specialSelectorsNArgs[offset+16],
+            return client.send(this.vm.specialSelectors[2 * (offset + 16)],
+                this.vm.specialSelectors[2 * (offset + 16) + 1],
                 false);
         if (type > 12)
             return client.send(method.methodGetLiteral(offset), type-13, false);
